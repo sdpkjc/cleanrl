@@ -4,6 +4,7 @@ import random
 import time
 from dataclasses import dataclass
 
+import flashbax as fbx
 import flax
 import flax.linen as nn
 import gymnasium as gym
@@ -13,7 +14,6 @@ import numpy as np
 import optax
 import tyro
 from flax.training.train_state import TrainState
-from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -153,14 +153,25 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_action = float(envs.single_action_space.high[0])
-    envs.single_observation_space.dtype = np.float32
-    rb = ReplayBuffer(
+    envs.single_observation_space.dtype = np.dtype(np.float32)
+
+    rb = fbx.make_flat_buffer(
         args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
-        device="cpu",
-        handle_timeout_termination=False,
+        args.learning_starts,
+        sample_batch_size=args.batch_size,
+        add_batch_size=1,
     )
+    rb_state = rb.init(
+        {
+            "observations": jnp.asarray(envs.single_observation_space.sample()),
+            "next_observations": jnp.asarray(envs.single_observation_space.sample()),
+            "actions": jnp.asarray(envs.single_action_space.sample()),
+            "rewards": jnp.array(1.0),
+            "dones": jnp.array(True, dtype=jnp.bool),
+        }
+    )
+    jit_rb_add = jax.jit(rb.add)
+    jit_rb_sample = jax.jit(rb.sample)
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
@@ -264,20 +275,15 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
-            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+            actions = jnp.asarray(np.asarray([envs.single_action_space.sample() for _ in range(envs.num_envs)]))
         else:
             actions = actor.apply(actor_state.params, obs)
-            actions = np.array(
-                [
-                    (
-                        jax.device_get(actions)[0]
-                        + np.random.normal(0, max_action * args.exploration_noise, size=envs.single_action_space.shape)
-                    ).clip(envs.single_action_space.low, envs.single_action_space.high)
-                ]
-            )
+            actions = (
+                actions + jnp.random.normal(0, max_action * args.exploration_noise, size=envs.single_action_space.shape)
+            ).clip(envs.single_action_space.low, envs.single_action_space.high)
 
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+        next_obs, rewards, terminations, truncations, infos = envs.step(np.asarray(actions))
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
@@ -292,24 +298,35 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         for idx, trunc in enumerate(truncations):
             if trunc:
                 real_next_obs[idx] = infos["final_observation"][idx]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+        rb_state = jit_rb_add(
+            rb_state,
+            {
+                "observations": obs,
+                "next_observations": real_next_obs,
+                "actions": actions,
+                "rewards": rewards,
+                "dones": terminations,
+            },
+        )
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
-            data = rb.sample(args.batch_size)
+            with jax.default_device(jax.devices("gpu")[0]):
+                key, rb_sample_key = jax.random.split(key)
+                data = jit_rb_sample(rb_state, rb_sample_key).experience.first
 
             (qf1_state, qf2_state), (qf1_loss_value, qf2_loss_value), (qf1_a_values, qf2_a_values), key = update_critic(
                 actor_state,
                 qf1_state,
                 qf2_state,
-                data.observations.numpy(),
-                data.actions.numpy(),
-                data.next_observations.numpy(),
-                data.rewards.flatten().numpy(),
-                data.dones.flatten().numpy(),
+                data["observations"],
+                data["actions"],
+                data["next_observations"],
+                data["rewards"].flatten(),
+                data["dones"].flatten(),
                 key,
             )
 
@@ -318,7 +335,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     actor_state,
                     qf1_state,
                     qf2_state,
-                    data.observations.numpy(),
+                    data["observations"],
                 )
 
             if global_step % 100 == 0:
